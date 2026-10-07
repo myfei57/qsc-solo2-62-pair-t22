@@ -8,6 +8,7 @@ from coldstore.ammonia import validate_ppm, validate_threshold
 from coldstore.comp import validate_stage
 from coldstore.evap import validate_baseline
 from coldstore.fan import PRIMARY, STANDBY
+from coldstore.ledger import DEFAULT_BUDGET
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
@@ -117,15 +118,15 @@ def system(server: "Server", request: Request) -> Response:
 
 
 def history_append(server: "Server", request: Request) -> Response:
-    return history.append(server.runtime.store, request)
+    return history.append(server.runtime.ledger, request)
 
 
 def history_list(server: "Server", request: Request) -> Response:
-    return history.listing(server.runtime.store)
+    return history.listing(server.runtime.ledger)
 
 
 def history_clear(server: "Server", request: Request) -> Response:
-    return history.clear(server.runtime.store)
+    return history.clear(server.runtime.ledger)
 
 
 def metrics(server: "Server", request: Request) -> Response:
@@ -645,6 +646,34 @@ def audit_filter(server: "Server", request: Request) -> Response:
 
 def audit_totals(server: "Server", request: Request) -> Response:
     return json_response({"totals": server.runtime.auditor.totals()})
+
+
+def retention_window_set(server: "Server", request: Request) -> Response:
+    kind = request.str_field("kind")
+    seconds = request.int_field("seconds")
+    return json_response(server.runtime.ledger.set_window(kind, seconds))
+
+
+def retention_windows(server: "Server", request: Request) -> Response:
+    ledger = server.runtime.ledger
+    return json_response({"windows": ledger.windows(), "history": ledger.window_history()})
+
+
+def retention_sweep(server: "Server", request: Request) -> Response:
+    budget = request.int_field("budget", DEFAULT_BUDGET)
+    return json_response(server.runtime.sweeper.run(budget=budget).as_dict())
+
+
+def retention_status(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.sweeper.status().as_dict())
+
+
+def ledger_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.ledger.state().as_dict())
+
+
+def ledger_verify(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.ledger.verify())
 
 
 def schedule_state(server: "Server", request: Request) -> Response:

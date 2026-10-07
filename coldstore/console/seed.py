@@ -11,16 +11,15 @@ from coldstore.fan import FanSet
 from coldstore.load import DEFAULT_BASELINE, LoadCalculator
 from coldstore.load.calc import BASELINE_KEY as LOAD_BASELINE_KEY
 from coldstore.load.calc import COEFFICIENT_KEY, DEFAULT_COEFFICIENT
+from coldstore.ledger import Ledger
 from coldstore.quota import Accumulator
 from coldstore.scheduler import Scheduler
 from coldstore.scheduler.planner import THRESHOLD_KEY as SCHEDULE_THRESHOLD_KEY
 from coldstore.scheduler.planner import DEFAULT_THRESHOLD as SCHEDULE_THRESHOLD
-from coldstore.store import Store, append_event, has_key
+from coldstore.store import Store, has_key
 from coldstore.temp import Collector
 from coldstore.temp.collector import WINDOW_KEY
 from coldstore.temp.collector import DEFAULT_WINDOW as TEMP_WINDOW
-
-from .history import EVENT_KEY
 
 
 def seed_defaults(store: Store) -> None:
@@ -52,4 +51,4 @@ def seed_defaults(store: Store) -> None:
     if not has_key(store, SCHEDULE_THRESHOLD_KEY):
         scheduler.set_threshold(SCHEDULE_THRESHOLD)
 
-    append_event(store, EVENT_KEY, "seed", "defaults")
+    Ledger(store).append_event("seed", "defaults")
