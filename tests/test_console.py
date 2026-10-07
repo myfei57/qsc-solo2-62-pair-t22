@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 
 from coldstore.console.routes import route_table
@@ -66,6 +67,7 @@ class ConsoleCase(unittest.TestCase):
                 "load",
                 "quota",
                 "audit",
+                "retention",
                 "schedule",
             },
         )
@@ -371,6 +373,74 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["threshold"], -25.0)
         _, body = self.call("GET", "/schedule")
         self.assertEqual(body["due"], ["r2", "r1"])
+
+    def test_retention_routes(self) -> None:
+        for value in ["a", "b", "c"]:
+            status, _ = self.call("POST", "/history", {"kind": "manual", "value": value})
+            self.assertEqual(status, 200)
+
+        status, body = self.call("POST", "/retention/window", {"category": "manual", "seconds": 60})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["seconds"], 60)
+        status, body = self.call("GET", "/retention/windows")
+        self.assertEqual(body["windows"], {"manual": 60})
+
+        future = int(time.time()) + 3600
+        status, body = self.call("POST", "/retention/sweep", {"budget": 2, "now": future})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "partial")
+        self.assertEqual(body["deleted"], 2)
+        self.assertEqual(body["cursor"], "manual")
+
+        _, listing = self.call("GET", "/history")
+        self.assertEqual(listing["count"], 2)
+
+        status, body = self.call("GET", "/retention/archive")
+        self.assertEqual(body["count"], 2)
+        self.assertEqual({event["value"] for event in body["events"]}, {"a", "b"})
+        status, body = self.call("POST", "/retention/archive/filter", {"category": "manual"})
+        self.assertEqual(body["count"], 2)
+        status, body = self.call("POST", "/retention/archive/filter", {"category": "seed"})
+        self.assertEqual(body["count"], 0)
+
+        status, body = self.call("POST", "/retention/sweep", {"budget": 2, "now": future})
+        self.assertEqual(body["status"], "done")
+        self.assertEqual(body["deleted"], 1)
+        _, listing = self.call("GET", "/history")
+        self.assertEqual(listing["count"], 1)
+
+        status, body = self.call("GET", "/retention/runs")
+        self.assertEqual([run["status"] for run in body["runs"]], ["partial", "done"])
+        self.assertEqual(body["runs"][1]["resumed_from"], "manual")
+
+        status, body = self.call("GET", "/retention/ledger")
+        self.assertEqual(
+            {entry["kind"] for entry in body["entries"]}, {"window", "archive", "sweep"}
+        )
+        raw, present = self.store.get("retention:ledger")
+        self.assertTrue(present)
+        self.assertEqual(len(json.loads(raw)), body["count"])
+
+        status, body = self.call("GET", "/retention/verify")
+        self.assertTrue(body["ok"])
+
+        status, body = self.call("GET", "/retention")
+        self.assertEqual(body["windows"], {"manual": 60})
+        self.assertEqual(body["archived_by_category"], {"manual": 3})
+        self.assertEqual(body["live_by_kind"], {"seed": 1})
+        self.assertEqual(body["last_run"]["status"], "done")
+        self.assertTrue(body["ledger_ok"])
+        self.assertIsNone(body["cursor"])
+
+        status, error = self.call("POST", "/retention/window", {"seconds": 60})
+        self.assertEqual(status, 400)
+        self.assertIn("category", error["error"])
+        status, error = self.call("POST", "/retention/window", {"category": "manual", "seconds": 0})
+        self.assertEqual(status, 400)
+        status, error = self.call("POST", "/retention/sweep", {"budget": 0})
+        self.assertEqual(status, 400)
+        status, error = self.call("POST", "/retention/archive/filter", {})
+        self.assertEqual(status, 400)
 
     def test_cycle_simulation_and_exports(self) -> None:
         self.add_room("r1", 1, -5.0)

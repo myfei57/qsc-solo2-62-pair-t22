@@ -22,10 +22,11 @@ class Event:
         return {"at": self.at, "kind": self.kind, "value": self.value}
 
 
-def append_event(store: Store, key: str, kind: str, value: str) -> None:
+def append_event(store: Store, key: str, kind: str, value: str, at: int | None = None) -> None:
     """Record one event under the supplied list key."""
 
-    event = Event(at=int(time.time()), kind=kind, value=value)
+    moment = int(at) if at is not None else int(time.time())
+    event = Event(at=moment, kind=kind, value=value)
     append_command(store, key, json.dumps(event.as_dict(), ensure_ascii=False))
 
 

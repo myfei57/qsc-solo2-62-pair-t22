@@ -11,11 +11,14 @@ from coldstore.fan import FanSet
 from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator
 from coldstore.quota import Accumulator
+from coldstore.retention import Sweeper
 from coldstore.room import RoomRegistry
 from coldstore.scheduler import Scheduler
 from coldstore.store import Store
 from coldstore.temp import Collector
 from coldstore.valve import SupplyValve
+
+from .history import EVENT_KEY
 
 
 class Runtime:
@@ -39,4 +42,5 @@ class Runtime:
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.retention = Sweeper(store, source=EVENT_KEY)
         self.scheduler = Scheduler(store)

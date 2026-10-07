@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 
@@ -18,6 +19,7 @@ from coldstore.load import LoadCalculator, compute_load, validate_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Accumulator, Quota, check_quota, validate_amount
 from coldstore.reporting import audit_export, to_csv
+from coldstore.retention import LEDGER_KEY, MAX_BUDGET, MAX_WINDOW_SECONDS, Ledger, Sweeper
 from coldstore.room import RoomRegistry, validate_zone
 from coldstore.scheduler import Scheduler, validate_threshold
 from coldstore.store import (
@@ -544,6 +546,143 @@ class AuditCase(unittest.TestCase):
             self.assertEqual(auditor.state().count, 3)
             self.assertEqual(auditor.totals(), {"comp": 3.0, "ammonia": 0.5})
             self.assertIn("audit entries=3", auditor.describe())
+
+
+class RetentionCase(unittest.TestCase):
+    def open_sweeper(self, tmp: str) -> tuple[Sweeper, Store]:
+        store = Store.open(f"{tmp}/state.json")
+        return Sweeper(store, source="console:events"), store
+
+    def test_window_round_trip_validation_and_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweeper, _ = self.open_sweeper(tmp)
+            self.assertEqual(sweeper.windows(), {})
+            sweeper.set_window("manual", 3600, at=1000)
+            self.assertEqual(sweeper.windows(), {"manual": 3600})
+            with self.assertRaises(ValueError):
+                sweeper.set_window("manual", 0)
+            with self.assertRaises(ValueError):
+                sweeper.set_window("manual", -10)
+            with self.assertRaises(ValueError):
+                sweeper.set_window("manual", MAX_WINDOW_SECONDS + 1)
+            with self.assertRaises(ValueError):
+                sweeper.set_window("", 60)
+            entries = sweeper.ledger_entries()
+            self.assertEqual([entry["kind"] for entry in entries], ["window"])
+            self.assertEqual(entries[0]["payload"], {"category": "manual", "seconds": 3600})
+            self.assertTrue(sweeper.verify())
+
+    def test_sweep_archives_expired_and_keeps_the_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweeper, store = self.open_sweeper(tmp)
+            append_event(store, "console:events", "manual", "a", at=100)
+            append_event(store, "console:events", "manual", "b", at=200)
+            append_event(store, "console:events", "seed", "x", at=300)
+            append_event(store, "console:events", "manual", "c", at=850)
+            sweeper.set_window("manual", 150, at=1000)
+            result = sweeper.sweep(now=1000, budget=10)
+            self.assertEqual(result.status, "done")
+            self.assertEqual(result.deleted, 2)
+            self.assertEqual(result.scanned, 3)
+            live = list_events(store, "console:events")
+            self.assertEqual(
+                [(event.kind, event.value) for event in live],
+                [("seed", "x"), ("manual", "c")],
+            )
+            archived = sweeper.archived()
+            self.assertEqual([event["value"] for event in archived], ["a", "b"])
+            self.assertEqual({event["category"] for event in archived}, {"manual"})
+            self.assertEqual({event["run"] for event in archived}, {result.run})
+            self.assertEqual(sweeper.archived("seed"), [])
+            self.assertTrue(sweeper.verify())
+            self.assertIn("archived=2", sweeper.describe())
+
+    def test_budget_splits_sweeps_and_cursor_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweeper, store = self.open_sweeper(tmp)
+            for index in range(5):
+                append_event(store, "console:events", "manual", f"e{index}", at=100 + index)
+            sweeper.set_window("manual", 150, at=1000)
+            first = sweeper.sweep(now=1000, budget=2)
+            self.assertEqual(first.status, "partial")
+            self.assertEqual(first.deleted, 2)
+            self.assertEqual(first.cursor, "manual")
+            self.assertEqual(sweeper.cursor(), {"category": "manual"})
+            self.assertEqual(event_count(store, "console:events"), 3)
+            second = sweeper.sweep(now=1000, budget=2)
+            self.assertEqual(second.status, "partial")
+            self.assertEqual(second.deleted, 2)
+            third = sweeper.sweep(now=1000, budget=2)
+            self.assertEqual(third.status, "done")
+            self.assertEqual(third.deleted, 1)
+            self.assertEqual(third.cursor, "")
+            self.assertIsNone(sweeper.cursor())
+            self.assertEqual(event_count(store, "console:events"), 0)
+            self.assertEqual(len(sweeper.archived()), 5)
+            runs = sweeper.runs()
+            self.assertEqual([run["status"] for run in runs], ["partial", "partial", "done"])
+            self.assertEqual(runs[1]["resumed_from"], "manual")
+            self.assertEqual(sum(int(run["deleted"]) for run in runs), 5)
+            self.assertTrue(sweeper.verify())
+
+    def test_replayed_crash_does_not_duplicate_the_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweeper, store = self.open_sweeper(tmp)
+            append_event(store, "console:events", "manual", "dup", at=100)
+            append_event(store, "console:events", "manual", "dup", at=100)
+            sweeper.set_window("manual", 150, at=1000)
+            sweeper.sweep(now=1000, budget=10)
+            self.assertEqual(len(sweeper.archived()), 2)
+            # A crash between the ledger append and the live log rewrite is
+            # replayed on the next run as the same events reappearing live.
+            append_event(store, "console:events", "manual", "dup", at=100)
+            append_event(store, "console:events", "manual", "dup", at=100)
+            result = sweeper.sweep(now=1000, budget=10)
+            self.assertEqual(result.deleted, 2)
+            self.assertEqual(len(sweeper.archived()), 2)
+            self.assertEqual(event_count(store, "console:events"), 0)
+
+    def test_tampered_ledger_is_detected_and_refuses_to_grow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweeper, store = self.open_sweeper(tmp)
+            append_event(store, "console:events", "manual", "a", at=100)
+            sweeper.set_window("manual", 150, at=1000)
+            sweeper.sweep(now=1000, budget=10)
+            self.assertTrue(sweeper.verify())
+            raw = load_commands(store, LEDGER_KEY)
+            forged = json.loads(raw[0])
+            forged["payload"]["seconds"] = 1
+            raw[0] = json.dumps(forged, ensure_ascii=False)
+            store.put(LEDGER_KEY, json.dumps(raw, ensure_ascii=False))
+            self.assertFalse(sweeper.verify())
+            with self.assertRaises(ValueError):
+                sweeper.set_window("manual", 60)
+            with self.assertRaises(ValueError):
+                sweeper.sweep(now=1000)
+
+    def test_interrupted_run_is_reported_and_continued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweeper, store = self.open_sweeper(tmp)
+            ledger = Ledger(store)
+            ledger.append("sweep", {"run": "crashed", "phase": "begin", "budget": 5}, at=10)
+            self.assertEqual(sweeper.runs()[-1]["status"], "interrupted")
+            append_event(store, "console:events", "manual", "a", at=100)
+            sweeper.set_window("manual", 150, at=1000)
+            result = sweeper.sweep(now=1000, budget=10)
+            self.assertEqual(result.status, "done")
+            runs = sweeper.runs()
+            self.assertEqual(runs[-1]["continues"], "crashed")
+            self.assertEqual(runs[-1]["status"], "done")
+
+    def test_budget_and_now_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweeper, _ = self.open_sweeper(tmp)
+            with self.assertRaises(ValueError):
+                sweeper.sweep(now=1000, budget=0)
+            with self.assertRaises(ValueError):
+                sweeper.sweep(now=1000, budget=MAX_BUDGET + 1)
+            with self.assertRaises(ValueError):
+                sweeper.sweep(now=0)
 
 
 class SchedulerCase(unittest.TestCase):

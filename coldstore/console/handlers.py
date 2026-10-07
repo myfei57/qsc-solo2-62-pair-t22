@@ -12,6 +12,7 @@ from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
 from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.retention import DEFAULT_BUDGET
 from coldstore.room import validate_zone
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
@@ -24,7 +25,7 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -645,6 +646,63 @@ def audit_filter(server: "Server", request: Request) -> Response:
 
 def audit_totals(server: "Server", request: Request) -> Response:
     return json_response({"totals": server.runtime.auditor.totals()})
+
+
+def retention_state(server: "Server", request: Request) -> Response:
+    sweeper = server.runtime.retention
+    payload = sweeper.state().as_dict()
+    payload["live_by_kind"] = sweeper.live_counts()
+    payload["archived_by_category"] = sweeper.archived_counts()
+    payload["cursor"] = sweeper.cursor()
+    payload["last_run"] = sweeper.last_run()
+    return json_response(payload)
+
+
+def retention_windows(server: "Server", request: Request) -> Response:
+    return json_response({"windows": server.runtime.retention.windows()})
+
+
+def retention_window_set(server: "Server", request: Request) -> Response:
+    category = request.str_field("category")
+    if not category:
+        raise RequestError(400, "category is required")
+    seconds = server.runtime.retention.set_window(category, request.int_field("seconds"))
+    return json_response({"category": category, "seconds": seconds})
+
+
+def retention_sweep(server: "Server", request: Request) -> Response:
+    budget = request.int_field("budget", DEFAULT_BUDGET)
+    now = request.int_field("now", 0) or None
+    result = server.runtime.retention.sweep(now=now, budget=budget)
+    return json_response(result.as_dict())
+
+
+def retention_runs(server: "Server", request: Request) -> Response:
+    runs = server.runtime.retention.runs()
+    return json_response({"runs": runs, "count": len(runs)})
+
+
+def retention_archive(server: "Server", request: Request) -> Response:
+    events = server.runtime.retention.archived()
+    return json_response({"events": events, "count": len(events)})
+
+
+def retention_archive_filter(server: "Server", request: Request) -> Response:
+    category = request.str_field("category")
+    if not category:
+        raise RequestError(400, "category is required")
+    events = server.runtime.retention.archived(category)
+    return json_response({"events": events, "count": len(events)})
+
+
+def retention_ledger(server: "Server", request: Request) -> Response:
+    entries = server.runtime.retention.ledger_entries()
+    return json_response({"entries": entries, "count": len(entries)})
+
+
+def retention_verify(server: "Server", request: Request) -> Response:
+    sweeper = server.runtime.retention
+    return json_response({"ok": sweeper.verify(), "entries": sweeper.ledger_count()})
 
 
 def schedule_state(server: "Server", request: Request) -> Response:
